@@ -1,0 +1,21 @@
+[package]
+name = "streaming-histogram"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "_native"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ahash = "0.8.12"
+numpy = "0.27.0"
+pyo3 = { version = ">=0.27", features = ["extension-module"] }
+
+[dev-dependencies]
+criterion = "0.5"
+rand = "0.9.2"
+
+[[bench]]
+name = "core_histograms"
+harness = false

@@ -1,0 +1,10 @@
+{
+  "include": ["tests", "streaming_histogram"],
+  "exclude": [
+    ".venv",
+    "target"
+  ],
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "strict",
+  "reportMissingModuleSource": "none"
+}

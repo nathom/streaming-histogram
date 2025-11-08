@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tox:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v12
+
+      - name: Enable Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@v4
+
+      - name: Run tox matrix via Nix shell
+        run: nix develop .# --command bash -lc 'uvx tox'
+
+  pyright:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v12
+
+      - name: Enable Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@v4
+
+      - name: Build wheel and run Pyright
+        run: nix develop .# --command bash -lc 'uv run --reinstall --with . pyright'
