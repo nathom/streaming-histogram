@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import numbers
 from typing import Iterable, Iterator, Literal, Optional, Sequence, Union, cast
 
@@ -22,6 +23,13 @@ class Bucket:
 
 
 @dataclass(frozen=True)
+class DensityBucket:
+    start: float
+    end: float
+    density: float
+
+
+@dataclass(frozen=True)
 class Snapshot:
     index: int
     label: Optional[str]
@@ -40,8 +48,6 @@ class SnapshotDiff:
 
 
 class Histogram:
-    """Minimal front-end for the Rust histogram recorder with built-in snapshotting."""
-
     def __init__(
         self,
         range: Optional[tuple[float, float]],
@@ -103,6 +109,32 @@ class Histogram:
 
     def buckets(self) -> list[Bucket]:
         return [Bucket(start, end, count) for (start, end), count in self._impl.get()]
+
+    def density(self) -> list[DensityBucket]:
+        finite_buckets: list[Bucket] = [
+            Bucket(start, end, count)
+            for (start, end), count in self._impl.get()
+            if math.isfinite(start) and math.isfinite(end) and end > start
+        ]
+
+        if not finite_buckets:
+            return []
+
+        finite_total = sum(bucket.count for bucket in finite_buckets)
+        if finite_total == 0:
+            return []
+
+        normalization = 1.0 / finite_total
+        pdf: list[DensityBucket] = []
+        for bucket in finite_buckets:
+            start = bucket.start
+            end = bucket.end
+            width = end - start
+            pdf.append(
+                DensityBucket(start=start, end=end, density=(bucket.count * normalization) / width)
+            )
+
+        return pdf
 
     @property
     def total(self) -> int:
@@ -260,5 +292,14 @@ class Histogram:
         first_id = last_id - size + 1
         return first_id, last_id
 
+    def to_json(self) -> str:
+        return self._impl.to_json()
 
-__all__ = ["Bucket", "Histogram", "Snapshot", "SnapshotDiff"]
+    @classmethod
+    def from_json(cls, payload: str) -> "Histogram":
+        instance = cls.__new__(cls)
+        instance._impl = HistogramRecorder.from_json(payload)
+        return instance
+
+
+__all__ = ["Bucket", "DensityBucket", "Histogram", "Snapshot", "SnapshotDiff"]

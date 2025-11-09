@@ -11,6 +11,9 @@ crate-type = ["cdylib", "rlib"]
 ahash = "0.8.12"
 numpy = "0.27.0"
 pyo3 = { version = ">=0.27", features = ["extension-module"] }
+rayon = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 [dev-dependencies]
 criterion = "0.5"

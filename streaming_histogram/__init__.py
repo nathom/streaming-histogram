@@ -14,10 +14,11 @@ HistogramRecorder = _native.HistogramRecorder
 HistogramSnapshot = _native.HistogramSnapshot
 SparseHistogram = _native.SparseHistogram
 
-from .wrapper import Bucket, Histogram, Snapshot, SnapshotDiff
+from .wrapper import Bucket, DensityBucket, Histogram, Snapshot, SnapshotDiff
 
 __all__ = [
     "Bucket",
+    "DensityBucket",
     "DenseHistogram",
     "Histogram",
     "HistogramRecorder",

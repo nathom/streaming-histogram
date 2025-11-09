@@ -1,0 +1,114 @@
+name: Benchmarks
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BENCH_JSON: benchmarks/dense_parallel_scaling.json
+  BENCH_FIGURE: benchmarks/dense_parallel_scaling_ci.png
+  MPLBACKEND: agg
+
+jobs:
+  dense-parallel-scaling:
+    name: Dense Parallel Scaling
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v12
+
+      - name: Enable Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@v4
+
+      - name: Run benchmark
+        run: |
+          nix develop .# --command env BENCH_JSON="$BENCH_JSON" BENCH_FIGURE="$BENCH_FIGURE" MPLBACKEND="$MPLBACKEND" bash -lc '
+            set -euo pipefail
+            uv run --with . --group dev python benchmarks/comparison.py \
+              --figure "$BENCH_FIGURE" \
+              --json-output "$BENCH_JSON"
+          '
+
+      - name: Publish benchmark summary
+        run: |
+          cat <<'PY' > /tmp/render_benchmark_summary.py
+          import json
+          import os
+          from pathlib import Path
+
+          bench_json = Path(os.environ["BENCH_JSON"])
+          if not bench_json.exists():
+            raise SystemExit(f"Missing benchmark JSON: {bench_json}")
+
+          with bench_json.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+
+          def fmt_ms(value: float) -> str:
+            return f"{value:,.2f}"
+
+          def fmt_speedup(numerator: float, denominator: float) -> str:
+            if denominator <= 0:
+              return "inf"
+            return f"{numerator / denominator:,.2f}x"
+
+          def best_runtime(seq: float, par: float) -> float:
+            positives = [entry for entry in (seq, par) if entry > 0]
+            return min(positives) if positives else 0.0
+
+          lines: list[str] = []
+          lines.append("## Dense Parallel Scaling Results")
+          lines.append("")
+
+          for suite in payload.get("suites", []):
+            title = suite.get("kind", "?").capitalize()
+            lines.append(f"### {title} histogram scaling")
+            lines.append("")
+            lines.append("| Values | Sequential (ms) | Parallel (ms) | NumPy (ms) | Seq->Par speedup | Parallel vs NumPy | Best vs NumPy |")
+            lines.append("| ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+            for row in suite.get("rows", []):
+              seq = float(row["sequential"]["mean_ms"])
+              par = float(row["parallel"]["mean_ms"])
+              numpy_ms = float(row["numpy_runtime"]["mean_ms"])
+              best = best_runtime(seq, par)
+              lines.append(
+                "| {values:,} | {seq_ms} | {par_ms} | {numpy_ms_fmt} | {seq_par} | {par_numpy} | {best_numpy} |".format(
+                  values=row["size"],
+                  seq_ms=fmt_ms(seq),
+                  par_ms=fmt_ms(par),
+                  numpy_ms_fmt=fmt_ms(numpy_ms),
+                  seq_par=fmt_speedup(seq, par),
+                  par_numpy=fmt_speedup(numpy_ms, par),
+                  best_numpy=fmt_speedup(numpy_ms, best),
+                )
+              )
+            lines.append("")
+
+          figure_path = Path(os.environ.get("BENCH_FIGURE", "")).resolve()
+          if figure_path.exists():
+            lines.append(f"_Dense scaling plot saved to `{figure_path}`._")
+          else:
+            lines.append("_Dense scaling plot not found._")
+          lines.append("")
+
+          markdown = "\n".join(lines).strip()
+          if not markdown:
+            markdown = "No benchmark data found."
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+            with open(summary_path, "a", encoding="utf-8") as handle:
+              handle.write(markdown + "\n")
+
+          print(markdown)
+          PY
+
+          nix develop .# --command env BENCH_JSON="$BENCH_JSON" BENCH_FIGURE="$BENCH_FIGURE" uv run --with . python /tmp/render_benchmark_summary.py
