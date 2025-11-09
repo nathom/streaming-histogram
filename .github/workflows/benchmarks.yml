@@ -31,9 +31,6 @@ jobs:
           nix develop .# --command env BENCH_JSON="$BENCH_JSON" MPLBACKEND="$MPLBACKEND" bash -lc '
             set -euo pipefail
             uv run --with . --group dev python benchmarks/dense_parallel_scaling.py \
-              --sizes 50000 100000 250000 \
-              --warmup 0 \
-              --repeat 1 \
               --figure benchmarks/dense_parallel_scaling_ci.png \
               --json-output "$BENCH_JSON"
           '
