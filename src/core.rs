@@ -1,6 +1,10 @@
 use ahash::RandomState;
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+
+const SERIALIZATION_VERSION: u32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct HistogramError {
@@ -29,7 +33,7 @@ impl fmt::Display for HistogramError {
 
 impl std::error::Error for HistogramError {}
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 pub enum OutOfRangeMode {
     Clip,
     Ignore,
@@ -39,18 +43,23 @@ pub enum OutOfRangeMode {
 pub trait Histogram {
     fn ingest_value(&mut self, value: f64) -> Result<()>;
     fn get(&self) -> Vec<((f64, f64), u64)>;
+    fn update_sequential(&mut self, values: &[f64]) -> Result<()>;
+    fn update_parallel(&mut self, values: &[f64]) -> Result<()>;
 
-    fn update<I>(&mut self, values: I) -> Result<()>
-    where
-        I: IntoIterator<Item = f64>,
-    {
-        for value in values {
-            self.ingest_value(value)?;
+    fn parallel_threshold(&self) -> usize {
+        usize::MAX
+    }
+
+    fn update(&mut self, values: &[f64]) -> Result<()> {
+        if values.len() >= self.parallel_threshold() {
+            self.update_parallel(values)
+        } else {
+            self.update_sequential(values)
         }
-        Ok(())
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SparseHistogram {
     bin_width: f64,
     bins: HashMap<i64, u64, RandomState>,
@@ -60,6 +69,9 @@ pub struct SparseHistogram {
 }
 
 impl SparseHistogram {
+    const PARALLEL_MIN_VALUES: usize = 2_000_000;
+    const PARALLEL_MIN_CHUNK_SIZE: usize = 4_096;
+
     pub fn new(bin_width: f64) -> Result<Self> {
         if !bin_width.is_finite() || bin_width <= 0.0 {
             return Err(HistogramError::new(
@@ -93,12 +105,109 @@ impl SparseHistogram {
         let bin_idx = (value / self.bin_width).floor() as i64;
         *self.bins.entry(bin_idx).or_insert(0) += 1;
     }
+
+    fn parallel_chunk_size(total_values: usize) -> usize {
+        let threads = rayon::current_num_threads().max(1);
+        Self::PARALLEL_MIN_CHUNK_SIZE
+            .max(total_values / threads)
+            .max(1)
+    }
+
+    pub fn update_sequential(&mut self, values: &[f64]) -> Result<()> {
+        for &value in values {
+            self.ingest_raw(value);
+        }
+        Ok(())
+    }
+
+    pub fn update_parallel(&mut self, values: &[f64]) -> Result<()> {
+        if values.is_empty() {
+            return Ok(());
+        }
+
+        let bin_width = self.bin_width;
+        let chunk_size = Self::parallel_chunk_size(values.len());
+
+        let aggregated = values
+            .par_iter()
+            .with_min_len(chunk_size)
+            .fold(
+                || {
+                    (
+                        HashMap::<i64, u64, RandomState>::with_hasher(RandomState::default()),
+                        0u64,
+                        0u64,
+                        0u64,
+                    )
+                },
+                |mut acc, &value| {
+                    let (bins, neg_inf, pos_inf, nan) = &mut acc;
+                    if value.is_nan() {
+                        *nan += 1;
+                    } else if value.is_infinite() {
+                        if value.is_sign_negative() {
+                            *neg_inf += 1;
+                        } else {
+                            *pos_inf += 1;
+                        }
+                    } else {
+                        let bin_idx = (value / bin_width).floor() as i64;
+                        *bins.entry(bin_idx).or_insert(0) += 1;
+                    }
+                    acc
+                },
+            )
+            .reduce(
+                || {
+                    (
+                        HashMap::<i64, u64, RandomState>::with_hasher(RandomState::default()),
+                        0u64,
+                        0u64,
+                        0u64,
+                    )
+                },
+                |mut left, right| {
+                    let (left_bins, left_neg_inf, left_pos_inf, left_nan) = &mut left;
+                    let (right_bins, right_neg_inf, right_pos_inf, right_nan) = right;
+                    for (idx, count) in right_bins {
+                        *left_bins.entry(idx).or_insert(0) += count;
+                    }
+                    *left_neg_inf += right_neg_inf;
+                    *left_pos_inf += right_pos_inf;
+                    *left_nan += right_nan;
+                    left
+                },
+            );
+
+        let (bins, neg_inf, pos_inf, nan) = aggregated;
+
+        for (idx, count) in bins {
+            *self.bins.entry(idx).or_insert(0) += count;
+        }
+        self.neg_inf_bucket += neg_inf;
+        self.pos_inf_bucket += pos_inf;
+        self.nan_bucket += nan;
+
+        Ok(())
+    }
 }
 
 impl Histogram for SparseHistogram {
     fn ingest_value(&mut self, value: f64) -> Result<()> {
         self.ingest_raw(value);
         Ok(())
+    }
+
+    fn update_sequential(&mut self, values: &[f64]) -> Result<()> {
+        Self::update_sequential(self, values)
+    }
+
+    fn update_parallel(&mut self, values: &[f64]) -> Result<()> {
+        Self::update_parallel(self, values)
+    }
+
+    fn parallel_threshold(&self) -> usize {
+        Self::PARALLEL_MIN_VALUES
     }
 
     fn get(&self) -> Vec<((f64, f64), u64)> {
@@ -126,6 +235,7 @@ impl Histogram for SparseHistogram {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DenseHistogram {
     start: f64,
     end: f64,
@@ -135,6 +245,9 @@ pub struct DenseHistogram {
 }
 
 impl DenseHistogram {
+    const PARALLEL_MIN_VALUES: usize = 1_000_000;
+    const PARALLEL_MIN_CHUNK_SIZE: usize = 1_024;
+
     pub fn new(range: (f64, f64), num_bins: usize, out_of_range: OutOfRangeMode) -> Result<Self> {
         let (start, end) = range;
         if !start.is_finite() || !end.is_finite() {
@@ -204,11 +317,103 @@ impl DenseHistogram {
         let idx = idx.min(self.bins.len() - 1);
         self.bins[idx] += 1;
     }
+
+    fn index_for_parallel(&self, value: f64) -> Result<Option<usize>> {
+        if value.is_nan() {
+            return match self.out_of_range {
+                OutOfRangeMode::Error => Err(HistogramError::new("NaN values are not allowed")),
+                _ => Ok(None),
+            };
+        }
+
+        if value < self.start {
+            return match self.out_of_range {
+                OutOfRangeMode::Clip => Ok(Some(0)),
+                OutOfRangeMode::Ignore => Ok(None),
+                OutOfRangeMode::Error => {
+                    Err(HistogramError::new("value fell below histogram range"))
+                }
+            };
+        }
+        if value >= self.end {
+            return match self.out_of_range {
+                OutOfRangeMode::Clip => Ok(Some(self.bins.len() - 1)),
+                OutOfRangeMode::Ignore => Ok(None),
+                OutOfRangeMode::Error => Err(HistogramError::new("value exceeded histogram range")),
+            };
+        }
+
+        let idx = ((value - self.start) / self.bin_width).floor() as usize;
+        Ok(Some(idx.min(self.bins.len() - 1)))
+    }
+    pub fn update_sequential(&mut self, values: &[f64]) -> Result<()> {
+        for &v in values {
+            self.ingest_value(v)?;
+        }
+        Ok(())
+    }
+
+    pub fn update_parallel(&mut self, values: &[f64]) -> Result<()> {
+        if values.is_empty() {
+            return Ok(());
+        }
+
+        let bins_len = self.bins.len();
+        let threads = rayon::current_num_threads().max(1);
+        let chunk_size = Self::PARALLEL_MIN_CHUNK_SIZE
+            .max(values.len() / threads)
+            .max(1);
+
+        let aggregated = values
+            .par_iter()
+            .with_min_len(chunk_size)
+            .fold(
+                || Ok(vec![0u64; bins_len]),
+                |acc_res, &value| {
+                    let mut acc = acc_res?;
+                    if let Some(bin_idx) = self.index_for_parallel(value)? {
+                        acc[bin_idx] += 1;
+                    }
+                    Ok(acc)
+                },
+            )
+            .reduce(
+                || Ok(vec![0u64; bins_len]),
+                |left_res, right_res| match (left_res, right_res) {
+                    (Ok(mut left), Ok(right)) => {
+                        for (l, r) in left.iter_mut().zip(right) {
+                            *l += r;
+                        }
+                        Ok(left)
+                    }
+                    (Err(err), _) => Err(err),
+                    (_, Err(err)) => Err(err),
+                },
+            )?;
+
+        for (bin, increment) in self.bins.iter_mut().zip(aggregated) {
+            *bin += increment;
+        }
+
+        Ok(())
+    }
 }
 
 impl Histogram for DenseHistogram {
     fn ingest_value(&mut self, value: f64) -> Result<()> {
         self.ingest_single(value)
+    }
+
+    fn update_sequential(&mut self, values: &[f64]) -> Result<()> {
+        Self::update_sequential(self, values)
+    }
+
+    fn update_parallel(&mut self, values: &[f64]) -> Result<()> {
+        Self::update_parallel(self, values)
+    }
+
+    fn parallel_threshold(&self) -> usize {
+        Self::PARALLEL_MIN_VALUES
     }
 
     fn get(&self) -> Vec<((f64, f64), u64)> {
@@ -224,16 +429,24 @@ impl Histogram for DenseHistogram {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct SnapshotEntry {
     index: u64,
     label: Option<String>,
-    bins: Vec<((f64, f64), u64)>,
+    bins: Vec<StoredBucket>,
 }
 
 impl SnapshotEntry {
     fn new(index: u64, label: Option<String>, bins: Vec<((f64, f64), u64)>) -> Self {
-        Self { index, label, bins }
+        Self {
+            index,
+            label,
+            bins: bins.into_iter().map(StoredBucket::from).collect(),
+        }
+    }
+
+    fn bins(&self) -> Vec<((f64, f64), u64)> {
+        self.bins.iter().map(|bucket| bucket.into()).collect()
     }
 }
 
@@ -249,7 +462,7 @@ impl HistogramSnapshot {
         Self {
             index: entry.index,
             label: entry.label.clone(),
-            bins: entry.bins.clone(),
+            bins: entry.bins(),
         }
     }
 
@@ -277,6 +490,77 @@ pub struct SnapshotDiff {
     start_label: Option<String>,
     end_label: Option<String>,
     bins: Vec<((f64, f64), u64)>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct StoredBucket {
+    start: BucketBound,
+    end: BucketBound,
+    count: u64,
+}
+
+impl From<((f64, f64), u64)> for StoredBucket {
+    fn from(((start, end), count): ((f64, f64), u64)) -> Self {
+        Self {
+            start: BucketBound::from(start),
+            end: BucketBound::from(end),
+            count,
+        }
+    }
+}
+
+impl From<StoredBucket> for ((f64, f64), u64) {
+    fn from(bucket: StoredBucket) -> Self {
+        (
+            (f64::from(bucket.start), f64::from(bucket.end)),
+            bucket.count,
+        )
+    }
+}
+
+impl From<&StoredBucket> for ((f64, f64), u64) {
+    fn from(bucket: &StoredBucket) -> Self {
+        (
+            (f64::from(bucket.start), f64::from(bucket.end)),
+            bucket.count,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum BucketBound {
+    Finite(f64),
+    NegInfinity,
+    PosInfinity,
+    Nan,
+}
+
+impl From<f64> for BucketBound {
+    fn from(value: f64) -> Self {
+        if value.is_nan() {
+            Self::Nan
+        } else if value.is_infinite() {
+            if value.is_sign_negative() {
+                Self::NegInfinity
+            } else {
+                Self::PosInfinity
+            }
+        } else {
+            Self::Finite(value)
+        }
+    }
+}
+
+impl From<BucketBound> for f64 {
+    fn from(bound: BucketBound) -> Self {
+        match bound {
+            BucketBound::Finite(value) => value,
+            BucketBound::NegInfinity => f64::NEG_INFINITY,
+            BucketBound::PosInfinity => f64::INFINITY,
+            BucketBound::Nan => f64::NAN,
+        }
+    }
 }
 
 impl SnapshotDiff {
@@ -321,6 +605,8 @@ impl SnapshotDiff {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "state", rename_all = "lowercase")]
 enum RecordedHistogram {
     Sparse(SparseHistogram),
     Dense(DenseHistogram),
@@ -340,13 +626,54 @@ impl RecordedHistogram {
             Self::Dense(hist) => <DenseHistogram as Histogram>::ingest_value(hist, value),
         }
     }
+
+    fn update(&mut self, values: &[f64]) -> Result<()> {
+        match self {
+            Self::Sparse(hist) => <SparseHistogram as Histogram>::update(hist, values),
+            Self::Dense(hist) => <DenseHistogram as Histogram>::update(hist, values),
+        }
+    }
+
+    fn update_sequential(&mut self, values: &[f64]) -> Result<()> {
+        match self {
+            Self::Sparse(hist) => hist.update_sequential(values),
+            Self::Dense(hist) => hist.update_sequential(values),
+        }
+    }
+
+    fn update_parallel(&mut self, values: &[f64]) -> Result<()> {
+        match self {
+            Self::Sparse(hist) => hist.update_parallel(values),
+            Self::Dense(hist) => hist.update_parallel(values),
+        }
+    }
+
+    fn parallel_threshold(&self) -> usize {
+        match self {
+            Self::Sparse(hist) => <SparseHistogram as Histogram>::parallel_threshold(hist),
+            Self::Dense(hist) => <DenseHistogram as Histogram>::parallel_threshold(hist),
+        }
+    }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct HistogramRecorder {
     inner: RecordedHistogram,
     snapshots: VecDeque<SnapshotEntry>,
     next_snapshot_index: u64,
     max_snapshots: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct RecorderStateRef<'a> {
+    version: u32,
+    recorder: &'a HistogramRecorder,
+}
+
+#[derive(Deserialize)]
+struct RecorderStateOwned {
+    version: u32,
+    recorder: HistogramRecorder,
 }
 
 impl HistogramRecorder {
@@ -382,6 +709,36 @@ impl HistogramRecorder {
             RecordedHistogram::Dense(DenseHistogram::new(range, num_bins, out_of_range)?),
             max_snapshots,
         )
+    }
+
+    pub fn to_json(&self) -> Result<String> {
+        serde_json::to_string(&RecorderStateRef {
+            version: SERIALIZATION_VERSION,
+            recorder: self,
+        })
+        .map_err(|err| HistogramError::new(format!("failed to serialize histogram: {err}")))
+    }
+
+    pub fn from_json(payload: &str) -> Result<Self> {
+        let state: RecorderStateOwned = serde_json::from_str(payload).map_err(|err| {
+            HistogramError::new(format!("failed to deserialize histogram: {err}"))
+        })?;
+
+        if state.version != SERIALIZATION_VERSION {
+            return Err(HistogramError::new(format!(
+                "unsupported histogram serialization version {}",
+                state.version
+            )));
+        }
+
+        let mut recorder = state.recorder;
+        if let Some(limit) = recorder.max_snapshots {
+            if limit == 0 {
+                return Err(HistogramError::new("max_snapshots must be positive"));
+            }
+        }
+        recorder.enforce_max_snapshots();
+        Ok(recorder)
     }
 
     fn first_snapshot_id(&self) -> u64 {
@@ -474,14 +831,16 @@ impl HistogramRecorder {
             }
         }
 
+        let earlier_bins = earlier.bins();
         let mut earlier_map = HashMap::with_hasher(RandomState::new());
-        for ((start, end), count) in &earlier.bins {
+        for ((start, end), count) in &earlier_bins {
             earlier_map.insert(BucketKey::from_bounds(*start, *end), *count);
         }
 
+        let later_bins = later.bins();
         let mut later_map = HashMap::with_hasher(RandomState::new());
         let mut diff_bins = Vec::new();
-        for ((start, end), count) in &later.bins {
+        for ((start, end), count) in &later_bins {
             let key = BucketKey::from_bounds(*start, *end);
             later_map.insert(key.clone(), *count);
             let previous = earlier_map.get(&key).copied().unwrap_or(0);
@@ -517,11 +876,8 @@ impl HistogramRecorder {
         ))
     }
 
-    pub fn update<I>(&mut self, values: I) -> Result<()>
-    where
-        I: IntoIterator<Item = f64>,
-    {
-        Histogram::update(self, values)
+    pub fn update(&mut self, values: &[f64]) -> Result<()> {
+        self.inner.update(values)
     }
 
     pub fn get(&self) -> Vec<((f64, f64), u64)> {
@@ -566,5 +922,17 @@ impl Histogram for HistogramRecorder {
 
     fn get(&self) -> Vec<((f64, f64), u64)> {
         self.inner.bins()
+    }
+
+    fn update_sequential(&mut self, values: &[f64]) -> Result<()> {
+        self.inner.update_sequential(values)
+    }
+
+    fn update_parallel(&mut self, values: &[f64]) -> Result<()> {
+        self.inner.update_parallel(values)
+    }
+
+    fn parallel_threshold(&self) -> usize {
+        self.inner.parallel_threshold()
     }
 }

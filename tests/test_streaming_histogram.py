@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+import json
 import math
 
 import numpy as np
@@ -8,6 +9,7 @@ import pytest
 
 from streaming_histogram import (
     DenseHistogram,
+    DensityBucket,
     Histogram,
     HistogramRecorder,
     SparseHistogram,
@@ -29,6 +31,36 @@ def _canonicalize(entries: Iterable[Bucket]) -> list[CanonicalBucket]:
             key = (start, end)
         normalized.append((key, count))
     return normalized
+
+
+def _canonicalize_json(payload: str) -> str:
+    return json.dumps(json.loads(payload), sort_keys=True, separators=(",", ":"))
+
+
+REFERENCE_JSON_DENSE_CLIP = (
+    '{"recorder":{"inner":{"kind":"dense","state":{"bin_width":0.25,"bins":[1,1,0,2],'
+    '"end":1.0,"out_of_range":"Clip","start":0.0}},"max_snapshots":3,"next_snapshot_index":2,'
+    '"snapshots":[{"bins":[{"count":1,"end":{"finite":0.25},"start":{"finite":0.0}},'
+    '{"count":0,"end":{"finite":0.5},"start":{"finite":0.25}},'
+    '{"count":0,"end":{"finite":0.75},"start":{"finite":0.5}},'
+    '{"count":1,"end":{"finite":1.0},"start":{"finite":0.75}}],"index":0,"label":"alpha"},'
+    '{"bins":[{"count":1,"end":{"finite":0.25},"start":{"finite":0.0}},'
+    '{"count":1,"end":{"finite":0.5},"start":{"finite":0.25}},'
+    '{"count":0,"end":{"finite":0.75},"start":{"finite":0.5}},'
+    '{"count":2,"end":{"finite":1.0},"start":{"finite":0.75}}],"index":1,"label":"beta"}]},'
+    '"version":1}'
+)
+
+
+REFERENCE_JSON_DENSE_IGNORE = (
+    '{"recorder":{"inner":{"kind":"dense","state":{"bin_width":1.0,"bins":[2,1],"end":2.0,'
+    '"out_of_range":"Ignore","start":0.0}},"max_snapshots":null,"next_snapshot_index":2,'
+    '"snapshots":[{"bins":[{"count":1,"end":{"finite":1.0},"start":{"finite":0.0}},'
+    '{"count":1,"end":{"finite":2.0},"start":{"finite":1.0}}],"index":0,"label":"start"},'
+    '{"bins":[{"count":2,"end":{"finite":1.0},"start":{"finite":0.0}},'
+    '{"count":1,"end":{"finite":2.0},"start":{"finite":1.0}}],"index":1,"label":null}]},'
+    '"version":1}'
+)
 
 
 def _build_histogram_with_snapshots(count: int) -> Histogram:
@@ -546,3 +578,101 @@ def test_histogram_sparse_accepts_explicit_nones():
     hist = Histogram(None, None, bin_width=0.25)
     hist.feed([0.1, 0.2])
     assert hist.total == 2
+
+
+def test_histogram_density_returns_pdf():
+    hist = Histogram(None, None, bin_width=0.5)
+    hist.feed([-0.25, 0.1, 0.6, float("inf"), float("nan")])
+
+    densities = hist.density()
+    bounds = [(bucket.start, bucket.end) for bucket in densities]
+    assert bounds == [(-0.5, 0.0), (0.0, 0.5), (0.5, 1.0)]
+
+    for bucket in densities:
+        assert isinstance(bucket, DensityBucket)
+        observed = bucket.density
+        assert math.isclose(observed, 2.0 / 3.0, rel_tol=1e-12)
+
+
+def test_histogram_density_ignores_special_buckets_when_empty():
+    hist = Histogram(None, None, bin_width=0.25)
+    hist.feed([float("inf"), float("nan")])
+
+    assert hist.density() == []
+
+
+def test_histogram_serialization_round_trip():
+    hist = Histogram(None, None, bin_width=0.5, max_snapshots=5)
+    hist.feed([-0.25, 0.1, 0.49, float("nan"), float("inf"), float("-inf")])
+    hist.snapshot("phase_a")
+    hist.feed([0.75, 1.25])
+    hist.snapshot("phase_b")
+
+    payload = hist.to_json()
+    revived = Histogram.from_json(payload)
+
+    revived_bins = [((bucket.start, bucket.end), bucket.count) for bucket in revived.buckets()]
+    original_bins = [((bucket.start, bucket.end), bucket.count) for bucket in hist.buckets()]
+    assert _canonicalize(revived_bins) == _canonicalize(original_bins)
+    assert len(revived) == len(hist)
+
+    revived.feed([2.0])
+    next_snapshot = revived.snapshot("phase_c")
+    assert next_snapshot.index == hist[-1].index + 1
+
+    diff = revived.diff(next_snapshot.index, next_snapshot.index - 1)
+    assert diff.total == 1
+
+
+def test_histogram_serialization_preserves_snapshot_window():
+    hist = Histogram(None, None, bin_width=0.25, max_snapshots=2)
+    for i in range(4):
+        hist.feed([float(i)])
+        hist.snapshot(f"phase_{i}")
+
+    assert len(hist) == 2
+    payload = hist.to_json()
+    revived = Histogram.from_json(payload)
+
+    assert len(revived) == 2
+    revived.feed([10.0])
+    next_snapshot = revived.snapshot("post")
+    assert next_snapshot.index == hist[-1].index + 1
+    assert len(revived) == 2
+    assert revived[-1].label == "post"
+
+
+def test_histogram_serialization_rejects_wrong_version():
+    hist = Histogram(None, None, bin_width=0.5)
+    hist.feed([0.1])
+    hist.snapshot("phase")
+
+    payload = hist.to_json()
+    data = json.loads(payload)
+    data["version"] = 999
+    tampered = json.dumps(data)
+
+    with pytest.raises(ValueError, match="unsupported histogram serialization version"):
+        Histogram.from_json(tampered)
+
+
+def test_histogram_serialization_matches_reference_dense_clip():
+    hist = Histogram((0.0, 1.0), 4, max_snapshots=3)
+    hist.feed([0.1, 0.9])
+    hist.snapshot("alpha")
+    hist.feed([0.25, 0.75])
+    hist.snapshot("beta")
+
+    canonical = _canonicalize_json(hist.to_json())
+    assert canonical == REFERENCE_JSON_DENSE_CLIP
+
+
+def test_histogram_serialization_matches_reference_dense_ignore():
+    hist = Histogram((0.0, 2.0), 2, out_of_range="Ignore")
+    hist.feed([-0.5, 0.5, 1.5, 2.5])
+    hist.snapshot("start")
+    hist.feed([0.1])
+    hist.snapshot()
+
+    canonical = _canonicalize_json(hist.to_json())
+    assert canonical == REFERENCE_JSON_DENSE_IGNORE

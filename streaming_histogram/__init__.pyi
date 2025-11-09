@@ -24,6 +24,12 @@ class Bucket:
     count: int
 
 
+class DensityBucket:
+    start: float
+    end: float
+    density: float
+
+
 class Snapshot:
     index: int
     label: str | None
@@ -55,6 +61,8 @@ class Histogram:
 
     def buckets(self) -> list[Bucket]: ...
 
+    def density(self) -> list[DensityBucket]: ...
+
     @property
     def total(self) -> int: ...
 
@@ -76,9 +84,15 @@ class Histogram:
     @overload
     def __getitem__(self, index: slice) -> SnapshotDiff: ...
 
+    def to_json(self) -> str: ...
+
+    @classmethod
+    def from_json(cls, payload: str) -> Histogram: ...
+
 
 __all__ = [
     "Bucket",
+    "DensityBucket",
     "DenseHistogram",
     "Histogram",
     "HistogramRecorder",

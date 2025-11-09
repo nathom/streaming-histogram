@@ -36,15 +36,15 @@ impl<'source, 'py> FromPyObject<'source, 'py> for OutOfRangeMode {
 }
 
 fn update_from_vec<H: CoreHistogram>(hist: &mut H, values: Vec<f64>) -> PyResult<()> {
-    hist.update(values).map_err(PyErr::from)
+    hist.update(&values).map_err(PyErr::from)
 }
 
 fn update_from_pyarray<'py, H: CoreHistogram>(
     hist: &mut H,
     values: PyReadonlyArrayDyn<'py, f64>,
 ) -> PyResult<()> {
-    hist.update(values.as_array().iter().copied())
-        .map_err(PyErr::from)
+    let slice = values.as_slice()?;
+    hist.update(slice).map_err(PyErr::from)
 }
 
 fn update_from_pyarray_mask<'py, H: CoreHistogram>(
@@ -88,6 +88,18 @@ impl PySparseHistogram {
         update_from_vec(&mut self.inner, values)
     }
 
+    pub fn update_sequential<'py>(&mut self, values: PyReadonlyArrayDyn<'py, f64>) -> PyResult<()> {
+        self.inner
+            .update_sequential(values.as_slice()?)
+            .map_err(PyErr::from)
+    }
+
+    pub fn update_parallel<'py>(&mut self, values: PyReadonlyArrayDyn<'py, f64>) -> PyResult<()> {
+        self.inner
+            .update_parallel(values.as_slice()?)
+            .map_err(PyErr::from)
+    }
+
     pub fn update_np<'py>(&mut self, values: PyReadonlyArrayDyn<'py, f64>) -> PyResult<()> {
         update_from_pyarray(&mut self.inner, values)
     }
@@ -121,6 +133,19 @@ impl PyDenseHistogram {
 
     pub fn update(&mut self, values: Vec<f64>) -> PyResult<()> {
         update_from_vec(&mut self.inner, values)
+    }
+
+    pub fn update_sequential<'py>(&mut self, values: PyReadonlyArrayDyn<'py, f64>) -> PyResult<()> {
+        self.inner
+            .update_sequential(values.as_slice()?)
+            .map_err(PyErr::from)
+    }
+
+    pub fn update_parallel<'py>(&mut self, values: PyReadonlyArrayDyn<'py, f64>) -> PyResult<()> {
+        // TODO: this requires contiguous numpy arrays as input. This shouldn't be necessary.
+        self.inner
+            .update_parallel(values.as_slice()?)
+            .map_err(PyErr::from)
     }
 
     pub fn update_np<'py>(&mut self, values: PyReadonlyArrayDyn<'py, f64>) -> PyResult<()> {
@@ -236,6 +261,13 @@ impl PyHistogramRecorder {
         })
     }
 
+    #[staticmethod]
+    fn from_json(payload: &str) -> PyResult<Self> {
+        Ok(Self {
+            inner: CoreHistogramRecorder::from_json(payload)?,
+        })
+    }
+
     pub fn update(&mut self, values: Vec<f64>) -> PyResult<()> {
         update_from_vec(&mut self.inner, values)
     }
@@ -284,6 +316,10 @@ impl PyHistogramRecorder {
 
     fn __len__(&self) -> usize {
         self.inner.len()
+    }
+
+    pub fn to_json(&self) -> PyResult<String> {
+        self.inner.to_json().map_err(PyErr::from)
     }
 }
 

@@ -3,7 +3,7 @@ use _native::core::{
 };
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use rand::{Rng, SeedableRng, rngs::StdRng};
-use std::{f64::consts::TAU, rc::Rc};
+use std::{f64::consts::TAU, rc::Rc, time::Duration};
 
 const SPARSE_SAMPLES: usize = 1_000_000;
 const DENSE_SAMPLES: usize = 1_500_000;
@@ -47,13 +47,13 @@ fn bench_sparse_histogram(c: &mut Criterion) {
     c.bench_function("sparse_update", |b| {
         b.iter(|| {
             let mut hist = SparseHistogram::new(0.25).unwrap();
-            hist.update(update_values.iter().copied()).unwrap();
+            hist.update(&update_values).unwrap();
             black_box(hist)
         });
     });
 
     let mut populated = SparseHistogram::new(0.25).unwrap();
-    populated.update(update_values.iter().copied()).unwrap();
+    populated.update(&update_values).unwrap();
     c.bench_function("sparse_get", |b| {
         b.iter(|| black_box(populated.get()));
     });
@@ -65,13 +65,13 @@ fn bench_dense_histogram(c: &mut Criterion) {
         b.iter(|| {
             let mut hist =
                 DenseHistogram::new(DENSE_RANGE, DENSE_BINS, OutOfRangeMode::Clip).unwrap();
-            hist.update(update_values.iter().copied()).unwrap();
+            hist.update_slice(&update_values).unwrap();
             black_box(hist)
         });
     });
 
     let mut populated = DenseHistogram::new(DENSE_RANGE, DENSE_BINS, OutOfRangeMode::Clip).unwrap();
-    populated.update(update_values.iter().copied()).unwrap();
+    populated.update_slice(&update_values).unwrap();
     c.bench_function("dense_get", |b| {
         b.iter(|| black_box(populated.get()));
     });
@@ -84,16 +84,16 @@ fn bench_histogram_recorder(c: &mut Criterion) {
     c.bench_function("recorder_update_snapshot", |b| {
         b.iter(|| {
             let mut recorder = HistogramRecorder::from_sparse(0.25, Some(64)).unwrap();
-            recorder.update(batch_one.iter().copied()).unwrap();
+            recorder.update(&batch_one).unwrap();
             black_box(recorder.snapshot(Some(String::from("bench"))));
         });
     });
 
     let prepared_recorder = {
         let mut recorder = HistogramRecorder::from_sparse(0.25, Some(64)).unwrap();
-        recorder.update(batch_one.iter().copied()).unwrap();
+        recorder.update(&batch_one).unwrap();
         recorder.snapshot(Some(String::from("baseline")));
-        recorder.update(batch_two.iter().copied()).unwrap();
+        recorder.update(&batch_two).unwrap();
         recorder.snapshot(None);
         Rc::new(recorder)
     };
@@ -107,10 +107,11 @@ fn bench_histogram_recorder(c: &mut Criterion) {
     });
 }
 
-criterion_group!(
-    histogram_benches,
-    bench_sparse_histogram,
-    bench_dense_histogram,
-    bench_histogram_recorder
-);
+criterion_group! {
+    name = histogram_benches;
+    config = Criterion::default()
+        .measurement_time(Duration::from_millis(500))
+        .warm_up_time(Duration::from_millis(100));
+    targets = bench_sparse_histogram, bench_dense_histogram, bench_histogram_recorder
+}
 criterion_main!(histogram_benches);

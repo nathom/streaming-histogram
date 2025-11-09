@@ -4,12 +4,45 @@ from __future__ import annotations
 
 import argparse
 import statistics
+import sys
 import time
+from pathlib import Path
 from typing import Callable, Iterable, Tuple
 
 import numpy as np
 
 from streaming_histogram import Histogram
+
+
+def ensure_native_extension_fresh(repo_root: Path) -> None:
+    so_candidates = sorted((repo_root / "streaming_histogram").glob("_native*.so"))
+    if not so_candidates:
+        raise RuntimeError(
+            "streaming_histogram/_native*.so not found; run `nix develop --command bash -lc '"
+            "source .venv/bin/activate && maturin develop'` to rebuild the extension before benchmarking."
+        )
+
+    newest_so = max(so_candidates, key=lambda path: path.stat().st_mtime)
+    source_paths = list((repo_root / "src").rglob("*.rs"))
+    source_paths.extend(
+        path
+        for path in (
+            repo_root / "Cargo.toml",
+            repo_root / "Cargo.lock",
+            repo_root / "pyproject.toml",
+        )
+        if path.exists()
+    )
+    if not source_paths:
+        return
+
+    newest_source_mtime = max(path.stat().st_mtime for path in source_paths)
+    if newest_so.stat().st_mtime + 1e-6 < newest_source_mtime:
+        raise RuntimeError(
+            "Detected stale streaming_histogram native build (Rust sources are newer than "
+            "streaming_histogram/_native*.so). Run `nix develop --command bash -lc 'source .venv/bin/activate "
+            "&& maturin develop'` and rerun the benchmark."
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -19,12 +52,18 @@ def parse_args() -> argparse.Namespace:
             "for a single histogram build."
         )
     )
-    parser.add_argument("--samples", type=int, default=1_000_000, help="number of values")
+    parser.add_argument(
+        "--samples",
+        type=int,
+        nargs="+",
+        default=[1_000_000, 5_000_000, 10_000_000, 100_000_000],
+        help="one or more sample counts to benchmark",
+    )
     parser.add_argument("--bins", type=int, default=256, help="bin count used for numpy and dense mode")
     parser.add_argument(
         "--mode",
         choices=("sparse", "dense"),
-        default="sparse",
+        default="dense",
         help="Histogram mode to benchmark",
     )
     parser.add_argument(
@@ -44,6 +83,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=2024, help="seed for RNG")
     parser.add_argument("--warmup", type=int, default=3, help="number of warmup runs")
     parser.add_argument("--repeat", type=int, default=10, help="number of timed runs")
+    parser.add_argument(
+        "--skip-build-check",
+        action="store_true",
+        help="skip validating that streaming_histogram's native extension is freshly built",
+    )
     return parser.parse_args()
 
 
@@ -116,30 +160,40 @@ def determine_range(data: np.ndarray, user_range: tuple[float, float] | None) ->
 
 def main() -> None:
     args = parse_args()
-    data = make_data(args.samples, args.distribution, args.seed)
-    hist_range = determine_range(data, None if args.range is None else (args.range[0], args.range[1]))
+    repo_root = Path(__file__).resolve().parents[1]
+    if not args.skip_build_check:
+        try:
+            ensure_native_extension_fresh(repo_root)
+        except RuntimeError as exc:
+            sys.exit(str(exc))
+    user_range = None if args.range is None else (args.range[0], args.range[1])
 
-    streaming_times = benchmark(
-        streaming_callable(data, args.bins, hist_range, args.mode), args.repeat, args.warmup
-    )
-    numpy_times = benchmark(numpy_callable(data, args.bins, hist_range), args.repeat, args.warmup)
-
-    print(f"samples: {args.samples:,}")
     print(f"bins:    {args.bins}")
-    if args.mode == "sparse":
-        width = (hist_range[1] - hist_range[0]) / args.bins
-        print(f"bin width (sparse): {width:.6f}")
     print(f"mode:    {args.mode}")
-    print(f"range:   {hist_range[0]:.4f} .. {hist_range[1]:.4f}")
     print(f"runs:    warmup={args.warmup}, repeat={args.repeat}")
-    print()
-    print(format_stats("streaming_histogram", streaming_times))
-    print(format_stats("numpy.histogram", numpy_times))
-    ratio = statistics.fmean(numpy_times) / statistics.fmean(streaming_times)
-    if ratio >= 1.0:
-        print(f"\nstreaming_histogram is {ratio:.2f}x faster on average")
-    else:
-        print(f"\nnumpy.histogram is {1/ratio:.2f}x faster on average")
+    print(f"dist:    {args.distribution}")
+
+    for samples in args.samples:
+        data = make_data(samples, args.distribution, args.seed)
+        hist_range = determine_range(data, user_range)
+
+        streaming_times = benchmark(
+            streaming_callable(data, args.bins, hist_range, args.mode), args.repeat, args.warmup
+        )
+        numpy_times = benchmark(numpy_callable(data, args.bins, hist_range), args.repeat, args.warmup)
+
+        print(f"\n=== {samples:,} samples ===")
+        if args.mode == "sparse":
+            width = (hist_range[1] - hist_range[0]) / args.bins
+            print(f"bin width (sparse): {width:.6f}")
+        print(f"range:   {hist_range[0]:.4f} .. {hist_range[1]:.4f}")
+        print(format_stats("streaming_histogram", streaming_times))
+        print(format_stats("numpy.histogram", numpy_times))
+        ratio = statistics.fmean(numpy_times) / statistics.fmean(streaming_times)
+        if ratio >= 1.0:
+            print(f"streaming_histogram is {ratio:.2f}x faster on average")
+        else:
+            print(f"numpy.histogram is {1/ratio:.2f}x faster on average")
 
 
 if __name__ == "__main__":
