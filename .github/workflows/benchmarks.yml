@@ -10,6 +10,7 @@ permissions:
 
 env:
   BENCH_JSON: benchmarks/dense_parallel_scaling.json
+  BENCH_FIGURE: benchmarks/dense_parallel_scaling_ci.png
   MPLBACKEND: agg
 
 jobs:
@@ -31,13 +32,14 @@ jobs:
           nix develop .# --command env BENCH_JSON="$BENCH_JSON" MPLBACKEND="$MPLBACKEND" bash -lc '
             set -euo pipefail
             uv run --with . --group dev python benchmarks/dense_parallel_scaling.py \
-              --figure benchmarks/dense_parallel_scaling_ci.png \
+              --figure "$BENCH_FIGURE" \
               --json-output "$BENCH_JSON"
           '
 
       - name: Publish benchmark summary
         run: |
           cat <<'PY' > /tmp/render_benchmark_summary.py
+          import base64
           import json
           import os
           from pathlib import Path
@@ -89,6 +91,17 @@ jobs:
               )
             lines.append("")
 
+          figure_path = Path(os.environ.get("BENCH_FIGURE", "")).resolve()
+          if figure_path.exists():
+            encoded = base64.b64encode(figure_path.read_bytes()).decode("ascii")
+            lines.append("## Dense Parallel Scaling Plot")
+            lines.append("")
+            lines.append(f"![Dense scaling plot](data:image/png;base64,{encoded})")
+            lines.append("")
+          else:
+            lines.append("_Dense scaling plot not found._")
+            lines.append("")
+
           markdown = "\n".join(lines).strip()
           if not markdown:
             markdown = "No benchmark data found."
@@ -101,4 +114,4 @@ jobs:
           print(markdown)
           PY
 
-          nix develop .# --command env BENCH_JSON="$BENCH_JSON" uv run --with . python /tmp/render_benchmark_summary.py
+          nix develop .# --command env BENCH_JSON="$BENCH_JSON" BENCH_FIGURE="$BENCH_FIGURE" uv run --with . python /tmp/render_benchmark_summary.py
