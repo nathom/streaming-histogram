@@ -3,10 +3,6 @@ name = "streaming-histogram"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-default = []
-bench-tools = []
-
 [lib]
 name = "_native"
 crate-type = ["cdylib", "rlib"]
