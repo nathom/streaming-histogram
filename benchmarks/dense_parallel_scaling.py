@@ -11,9 +11,11 @@ sizes.
 from __future__ import annotations
 
 import argparse
+import json
 import statistics
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Literal
 
@@ -49,6 +51,53 @@ class ModeSummary:
     mean_ms: float
     spread_ms: float
     samples_ms: list[float]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "mean_ms": self.mean_ms,
+            "spread_ms": self.spread_ms,
+            "samples_ms": list(self.samples_ms),
+        }
+
+
+@dataclass
+class SizeResult:
+    size: int
+    sequential: ModeSummary
+    parallel: ModeSummary
+    numpy_runtime: ModeSummary
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "size": self.size,
+            "sequential": self.sequential.to_dict(),
+            "parallel": self.parallel.to_dict(),
+            "numpy_runtime": self.numpy_runtime.to_dict(),
+        }
+
+
+@dataclass
+class SuiteResult:
+    kind: HistogramKind
+    bins: int
+    hist_range: tuple[float, float]
+    distribution: Distribution
+    warmup: int
+    repeat: int
+    figure_path: Path
+    rows: list[SizeResult]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "kind": self.kind,
+            "bins": self.bins,
+            "hist_range": [float(self.hist_range[0]), float(self.hist_range[1])],
+            "distribution": self.distribution,
+            "warmup": self.warmup,
+            "repeat": self.repeat,
+            "figure_path": str(self.figure_path),
+            "rows": [row.to_dict() for row in self.rows],
+        }
 
 
 def parse_args() -> argparse.Namespace:
@@ -115,6 +164,13 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="display the matplotlib window after saving the plot",
     )
+    parser.add_argument(
+        "--json-output",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="write benchmark statistics to PATH as JSON (default: disabled)",
+    )
     return parser.parse_args()
 
 
@@ -132,28 +188,36 @@ def main() -> None:
         (size, int(rng.integers(0, np.iinfo(np.int32).max))) for size in sizes
     ]
 
-    run_histogram_suite(
-        kind="dense",
-        size_seed_pairs=size_seed_pairs,
-        bins=args.bins,
-        hist_range=hist_range,
-        distribution=args.distribution,
-        warmup=args.warmup,
-        repeat=args.repeat,
-        figure_path=args.figure,
+    suite_results: list[SuiteResult] = []
+
+    suite_results.append(
+        run_histogram_suite(
+            kind="dense",
+            size_seed_pairs=size_seed_pairs,
+            bins=args.bins,
+            hist_range=hist_range,
+            distribution=args.distribution,
+            warmup=args.warmup,
+            repeat=args.repeat,
+            figure_path=args.figure,
+        )
+    )
+    sparse_figure = derive_sparse_figure_path(args.figure)
+    suite_results.append(
+        run_histogram_suite(
+            kind="sparse",
+            size_seed_pairs=size_seed_pairs,
+            bins=args.bins,
+            hist_range=hist_range,
+            distribution=args.distribution,
+            warmup=args.warmup,
+            repeat=args.repeat,
+            figure_path=sparse_figure,
+        )
     )
 
-    sparse_figure = derive_sparse_figure_path(args.figure)
-    run_histogram_suite(
-        kind="sparse",
-        size_seed_pairs=size_seed_pairs,
-        bins=args.bins,
-        hist_range=hist_range,
-        distribution=args.distribution,
-        warmup=args.warmup,
-        repeat=args.repeat,
-        figure_path=sparse_figure,
-    )
+    if args.json_output:
+        write_json_results(suite_results, args.json_output)
 
     if args.show:
         plt.show()
@@ -169,12 +233,13 @@ def run_histogram_suite(
     warmup: int,
     repeat: int,
     figure_path: Path,
-) -> None:
+) -> SuiteResult:
     label = "Dense" if kind == "dense" else "Sparse"
     print(f"Benchmarking {label}Histogram scaling...\n")
     summaries_parallel: list[ModeSummary] = []
     summaries_sequential: list[ModeSummary] = []
     summaries_numpy: list[ModeSummary] = []
+    rows: list[SizeResult] = []
 
     for size, seed in size_seed_pairs:
         samples = generate_samples(size, distribution, hist_range, seed)
@@ -208,6 +273,14 @@ def run_histogram_suite(
         summaries_sequential.append(seq_summary)
         summaries_parallel.append(par_summary)
         summaries_numpy.append(numpy_summary)
+        rows.append(
+            SizeResult(
+                size=size,
+                sequential=seq_summary,
+                parallel=par_summary,
+                numpy_runtime=numpy_summary,
+            )
+        )
         print(
             format_row(
                 size,
@@ -229,6 +302,30 @@ def run_histogram_suite(
         title=title,
     )
     print(f"Wrote plot to {figure_path}")
+    return SuiteResult(
+        kind=kind,
+        bins=bins,
+        hist_range=hist_range,
+        distribution=distribution,
+        warmup=warmup,
+        repeat=repeat,
+        figure_path=figure_path,
+        rows=rows,
+    )
+
+
+def write_json_results(results: list[SuiteResult], destination: str) -> None:
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "suites": [suite.to_dict() for suite in results],
+    }
+    serialized = json.dumps(payload, indent=2)
+    if destination == "-":
+        print(serialized)
+        return
+    dest_path = Path(destination)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    dest_path.write_text(serialized + "\n", encoding="utf-8")
 
 
 def generate_samples(
