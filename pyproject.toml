@@ -36,4 +36,12 @@ dev = [
     "matplotlib>=3.9.2",
     "tox>=4.32.0",
     "tox-uv>=1.29.0",
+    "ruff>=0.14.4",
 ]
+
+[tool.ruff]
+# indent-width = 2
+# line-length = 120
+
+[tool.ruff.format]
+indent-style = "space"

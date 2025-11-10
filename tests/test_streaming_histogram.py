@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 import json
 import math
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -140,9 +141,8 @@ def test_update_np_mask_shape_mismatch():
         hist.update_np_mask(values, mask)
 
 
-
 def test_dense_histogram_basic_bins():
-    hist = DenseHistogram((0.0, 1.0), 4, "Clip")
+    hist = DenseHistogram((0.0, 1.0), 4, "clip")
     hist.update([0.05, 0.24, 0.25, 0.75, 0.99])
 
     assert hist.get() == [
@@ -154,21 +154,21 @@ def test_dense_histogram_basic_bins():
 
 
 def test_dense_histogram_clip_behavior():
-    hist = DenseHistogram((0.0, 1.0), 2, "Clip")
+    hist = DenseHistogram((0.0, 1.0), 2, "clip")
     hist.update([-0.2, 0.1, 1.5, float("nan")])
 
     assert hist.get() == [((0.0, 0.5), 2), ((0.5, 1.0), 1)]
 
 
 def test_dense_histogram_ignore_behavior():
-    hist = DenseHistogram((0.0, 1.0), 2, "Ignore")
+    hist = DenseHistogram((0.0, 1.0), 2, "ignore")
     hist.update([-0.2, 0.1, 1.5])
 
     assert hist.get() == [((0.0, 0.5), 1), ((0.5, 1.0), 0)]
 
 
 def test_dense_histogram_error_behavior():
-    hist = DenseHistogram((0.0, 1.0), 2, "Error")
+    hist = DenseHistogram((0.0, 1.0), 2, "error")
 
     with pytest.raises(ValueError):
         hist.update([-0.1])
@@ -177,7 +177,7 @@ def test_dense_histogram_error_behavior():
 
 
 def test_dense_histogram_update_np():
-    hist = DenseHistogram((0.0, 1.0), 2, "Ignore")
+    hist = DenseHistogram((0.0, 1.0), 2, "ignore")
     arr = np.array([[0.1, 0.6], [1.2, -0.3]])
     hist.update_np(arr)
 
@@ -281,7 +281,7 @@ def test_recorder_diff_matches_increment_sparse():
 
 
 def test_recorder_diff_matches_increment_dense():
-    recorder = HistogramRecorder.from_dense((0.0, 1.0), 4, "Clip")
+    recorder = HistogramRecorder.from_dense((0.0, 1.0), 4, "clip")
     recorder.update([0.05, 0.2])
     first = recorder.snapshot(label=None)
 
@@ -293,7 +293,7 @@ def test_recorder_diff_matches_increment_dense():
     first_index = first.index
     diff = recorder.diff(second_index, first_index)
 
-    expected = DenseHistogram((0.0, 1.0), 4, "Clip")
+    expected = DenseHistogram((0.0, 1.0), 4, "clip")
     expected.update(new_batch)
     assert diff.bins() == expected.get()
 
@@ -547,7 +547,14 @@ def test_recorder_drain_snapshots_noop_when_before_window():
         recorder.update([float(i)])
         recorder.snapshot(label=None)
 
-    hist_ids = [snap.index for snap in (recorder.get_snapshot(0), recorder.get_snapshot(1), recorder.get_snapshot(2))]
+    hist_ids = [
+        snap.index
+        for snap in (
+            recorder.get_snapshot(0),
+            recorder.get_snapshot(1),
+            recorder.get_snapshot(2),
+        )
+    ]
     assert hist_ids == [0, 1, 2]
 
     removed = recorder.drain_snapshots(0)
@@ -559,13 +566,18 @@ def test_recorder_drain_snapshots_noop_when_before_window():
     # Second call with same bound should remove nothing.
     removed_again = recorder.drain_snapshots(2)
     assert removed_again == 0
+
+
 def test_histogram_sparse_requires_bin_width():
     with pytest.raises(ValueError, match="bin_width must be provided"):
         Histogram(None, None)
 
 
 def test_histogram_partial_range_bins_rejected():
-    with pytest.raises(ValueError, match="range and bins must either both be concrete values or both be None"):
+    with pytest.raises(
+        ValueError,
+        match="range and bins must either both be concrete values or both be None",
+    ):
         Histogram(range=(0.0, 1.0), bins=None)
 
 
@@ -611,8 +623,12 @@ def test_histogram_serialization_round_trip():
     payload = hist.to_json()
     revived = Histogram.from_json(payload)
 
-    revived_bins = [((bucket.start, bucket.end), bucket.count) for bucket in revived.buckets()]
-    original_bins = [((bucket.start, bucket.end), bucket.count) for bucket in hist.buckets()]
+    revived_bins = [
+        ((bucket.start, bucket.end), bucket.count) for bucket in revived.buckets()
+    ]
+    original_bins = [
+        ((bucket.start, bucket.end), bucket.count) for bucket in hist.buckets()
+    ]
     assert _canonicalize(revived_bins) == _canonicalize(original_bins)
     assert len(revived) == len(hist)
 
@@ -668,7 +684,7 @@ def test_histogram_serialization_matches_reference_dense_clip():
 
 
 def test_histogram_serialization_matches_reference_dense_ignore():
-    hist = Histogram((0.0, 2.0), 2, out_of_range="Ignore")
+    hist = Histogram((0.0, 2.0), 2, out_of_range="ignore")
     hist.feed([-0.5, 0.5, 1.5, 2.5])
     hist.snapshot("start")
     hist.feed([0.1])
@@ -676,3 +692,51 @@ def test_histogram_serialization_matches_reference_dense_ignore():
 
     canonical = _canonicalize_json(hist.to_json())
     assert canonical == REFERENCE_JSON_DENSE_IGNORE
+
+
+def _load_saved_payload(path: Path) -> dict[str, object]:
+    return json.loads(path.read_text("utf-8"))
+
+
+def test_histogram_disk_logging_resume(tmp_path: Path):
+    save_path = tmp_path / "hist.json"
+    hist = Histogram(
+        None,
+        None,
+        bin_width=0.5,
+        save_path=save_path,
+    )
+
+    hist.feed([0.0, 0.1])
+    hist.snapshot("alpha")
+    hist.feed([0.5])
+    hist.snapshot("beta")
+
+    assert _load_saved_payload(save_path) == json.loads(hist.to_json())
+    saved_length = len(hist)
+    last_index = hist.last_snapshot.index if hist.last_snapshot else -1
+
+    revived = Histogram(
+        None,
+        None,
+        bin_width=0.5,
+        save_path=save_path,
+        resume_from_path=True,
+    )
+
+    assert len(revived) == saved_length
+    assert revived.last_snapshot is not None
+    assert revived.last_snapshot.index == last_index
+
+    revived.snapshot("resumed")
+    assert _load_saved_payload(save_path) == json.loads(revived.to_json())
+
+
+def test_histogram_resume_requires_save_path(tmp_path: Path):
+    with pytest.raises(ValueError, match="save_path wasn't specified"):
+        Histogram(
+            None,
+            None,
+            bin_width=0.25,
+            resume_from_path=True,
+        )

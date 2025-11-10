@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from dataclasses import dataclass
 import math
 import numbers
@@ -10,7 +11,7 @@ import numpy.typing as npt
 
 from ._native import HistogramRecorder
 
-OutOfRangeMode = Literal["Clip", "Ignore", "Error"]
+OutOfRangeMode = Literal["clip", "ignore", "error"]
 ValueInput = Union[float, Sequence[float], Iterable[float], npt.NDArray[np.float64]]
 MaskInput = Union[npt.NDArray[np.bool_], Sequence[bool], Iterable[bool]]
 
@@ -54,9 +55,21 @@ class Histogram:
         bins: Optional[int],
         *,
         bin_width: Optional[float] = None,
-        out_of_range: OutOfRangeMode = "Clip",
+        out_of_range: OutOfRangeMode = "clip",
         max_snapshots: Optional[int] = None,
+        save_path: Optional[Path | str] = None,
+        resume_from_path: bool = False,
     ) -> None:
+        self.save_path: Optional[Path] = Path(save_path) if save_path else None
+
+        if resume_from_path:
+            if self.save_path is None:
+                raise ValueError(
+                    "resume_from_path is True, but save_path wasn't specified."
+                )
+            self._resume_from_path(self.save_path)
+            return
+
         if (range is None) != (bins is None):
             raise ValueError(
                 "range and bins must either both be concrete values or both be None"
@@ -68,17 +81,15 @@ class Histogram:
                     "bin_width must be provided when range and bins are both None"
                 )
             self._impl = HistogramRecorder.from_sparse(bin_width, max_snapshots)
-            return
-
-        if bin_width is not None:
-            raise ValueError(
-                "bin_width cannot be combined with explicit range/bins; set bin_width to None"
+        else:
+            if bin_width is not None:
+                raise ValueError(
+                    "bin_width cannot be combined with explicit range/bins; set bin_width to None"
+                )
+            assert bins is not None  # for type checkers; validated above
+            self._impl = HistogramRecorder.from_dense(
+                range, bins, out_of_range, max_snapshots
             )
-
-        assert bins is not None  # for type checkers; validated above
-        self._impl = HistogramRecorder.from_dense(
-            range, bins, out_of_range, max_snapshots
-        )
 
     def feed(self, values: ValueInput, mask: Optional[MaskInput] = None) -> None:
         if mask is not None:
@@ -131,7 +142,9 @@ class Histogram:
             end = bucket.end
             width = end - start
             pdf.append(
-                DensityBucket(start=start, end=end, density=(bucket.count * normalization) / width)
+                DensityBucket(
+                    start=start, end=end, density=(bucket.count * normalization) / width
+                )
             )
 
         return pdf
@@ -145,9 +158,12 @@ class Histogram:
         buckets = tuple(
             Bucket(start, end, count) for (start, end), count in snap.bins()
         )
-        return Snapshot(
+        snapshot = Snapshot(
             index=snap.index, label=snap.label, buckets=buckets, total=snap.total()
         )
+        if self.save_path is not None:
+            self._sync_to_disk(self.save_path)
+        return snapshot
 
     def diff(
         self, later: Optional[int] = None, earlier: Optional[int] = None
@@ -292,6 +308,10 @@ class Histogram:
         first_id = last_id - size + 1
         return first_id, last_id
 
+    def _sync_to_disk(self, save_path: Path) -> None:
+        with open(save_path, "w", encoding="utf-8") as f:
+            f.write(self.to_json())
+
     def to_json(self) -> str:
         return self._impl.to_json()
 
@@ -299,7 +319,12 @@ class Histogram:
     def from_json(cls, payload: str) -> "Histogram":
         instance = cls.__new__(cls)
         instance._impl = HistogramRecorder.from_json(payload)
+        instance.save_path = None
         return instance
+
+    def _resume_from_path(self, path: Path):
+        self._impl = HistogramRecorder.from_json(path.read_text("utf-8"))
+        self.save_path = path
 
 
 __all__ = ["Bucket", "DensityBucket", "Histogram", "Snapshot", "SnapshotDiff"]
